@@ -148,11 +148,39 @@ names it expects. The actual rootfs overlay lives in `rootfs_data`.
 
 ## Reverting to stock
 
-The patched bootloader stays compatible with the original Aruba firmware.
-Boot the OpenWrt initramfs, dump the original `aos0` and `aos1` UBI volumes
-beforehand if you want a backup, then later: wipe NAND from the patched
-APBoot console, let it recreate the default partitions, and flash the
-stock `aos0`/`aos1` back.
+The patched bootloader stays compatible with the original Aruba firmware,
+so reverting only requires the stock NAND contents — there is no need to
+restore the SPI bootloader.
+
+**Before flashing OpenWrt**, while the device is still on stock firmware,
+back up the two UBI volumes that hold the stock OS:
+
+1. Boot the OpenWrt initramfs on the device (using this tool, or manually
+   via `tftpboot` from the patched APBoot console).
+2. From the running initramfs, dump both volumes to your host:
+   ```sh
+   ssh root@<device-ip> "cat /dev/ubi0_0" > aos0.bin   # stock primary FW
+   ssh root@<device-ip> "cat /dev/ubi1_0" > aos1.bin   # stock secondary FW
+   ```
+   Store these alongside the patched `u-boot.mbn`.
+
+**To revert later**, from the patched APBoot console (115200 baud):
+
+1. `nand device 0`
+2. `nand erase.chip` — wipe everything in NAND.
+3. `reset` — APBoot's `board_late_init` recreates the default
+   `aos0`/`aos1`/`ubifs` UBI volumes on the next boot.
+4. Boot the OpenWrt initramfs again (TFTP) and write the backups back:
+   ```sh
+   scp aos0.bin aos1.bin root@<device-ip>:/tmp/
+   ssh root@<device-ip> "ubiupdatevol /dev/ubi0_0 /tmp/aos0.bin && \
+                         ubiupdatevol /dev/ubi1_0 /tmp/aos1.bin"
+   ```
+5. `reboot` — the device boots back into the stock Aruba OS.
+
+The patched bootloader stays in place; the only visible change vs. a
+factory device is that signature checking is disabled, which the stock OS
+does not mind.
 
 ## Troubleshooting
 
