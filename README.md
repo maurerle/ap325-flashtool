@@ -211,5 +211,9 @@ does not mind.
 - TFTP server and host-IP-setup patterns originally adapted from
   `fritzflash` in [`freifunk-darmstadt/fritz-tools`][fritz-tools].
 
+## License
+
+MIT — see [`LICENSE`](LICENSE).
+
 [apboot]: https://github.com/lukasstockner/ap325-apboot-openwrt
 [fritz-tools]: https://github.com/freifunk-darmstadt/fritz-tools
