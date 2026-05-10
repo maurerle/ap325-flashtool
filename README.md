@@ -25,8 +25,9 @@ patched bootloader source and prebuilt binary.
 - `pyserial` (`pip install pyserial`).
 - `ip`, `ssh`, `scp`, `ping` available on `$PATH`. Linux/macOS/FreeBSD or
   Windows (Windows uses `netsh`).
-- Root or `CAP_NET_BIND_SERVICE` + `CAP_NET_ADMIN` — the tool binds UDP/69
-  for TFTP and adds an IP to a network interface.
+- Root, or `CAP_NET_ADMIN` (to add a host IP) plus `CAP_NET_BIND_SERVICE` (to
+  bind UDP/69 for the embedded TFTP server — drop this one if you pass
+  `--external-tftp`).
 - A USB-to-serial adapter wired to the AP's RJ45 console port (Cisco pinout).
 - The AP's wired ethernet on the same L2 segment as your host — either
   directly, or via a switch when flashing multiple devices.
@@ -83,6 +84,39 @@ natively, so there is no per-device serialization in the network path.
 Each worker stays in an infinite loop. After a device finishes (or fails),
 power-cycle a fresh AP on the same serial line and the worker picks it up
 without restarting the tool. Stop the tool with Ctrl-C.
+
+## Using an external TFTP server
+
+If you already run a TFTP server on the network, pass its IP via
+`--external-tftp` and the tool won't start its own. APBoot's `serverip` env
+will be pointed at the external server. The tool no longer needs
+`CAP_NET_BIND_SERVICE` in this mode, since it doesn't bind UDP/69.
+
+```bash
+sudo python3 flash_aruba_ap325.py \
+    --bootloader  u-boot.mbn \
+    --initramfs   openwrt-ipq806x-generic-aruba_ap-325-initramfs.ari \
+    --sysupgrade  openwrt-ipq806x-generic-aruba_ap-325-squashfs-sysupgrade.bin \
+    --interface   eth0 \
+    --host-ip     192.168.1.50/24 \
+    --external-tftp 192.168.1.1 \
+    --port        /dev/ttyUSB0
+```
+
+Your TFTP root needs to serve the three files under their **basenames**, i.e.
+`u-boot.mbn`, `<initramfs>.ari`, and `<sysupgrade>.bin`. The bootloader is
+always requested as exactly `u-boot.mbn` (APBoot hardcodes that); the other
+two use the basename of whatever you pass on the command line.
+
+`--bootloader` and `--initramfs` are still validated as paths but never read
+when `--external-tftp` is set, so the absent-file check is skipped for them.
+The sysupgrade file is always read locally because it's uploaded over SCP,
+not TFTP.
+
+The `--external-tftp` IP and the device IPs do not have to be on the same
+subnet as `--host-ip` — only that the device can route to the TFTP server.
+The tool itself still needs to reach the device IP for SCP/SSH, so
+`--host-ip` should be in the same subnet as the auto-assigned device IPs.
 
 ## What it actually does
 

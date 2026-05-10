@@ -3,15 +3,16 @@
 Multi-device flash tool for the Aruba AP-325 access point.
 
 Runs the full 3-step OpenWrt install per device:
-  1. Flash patched APBoot bootloader (via TFTP from this tool).
+  1. Flash patched APBoot bootloader (fetched via TFTP).
   2. Repartition NAND and tftpboot the OpenWrt initramfs.
   3. Configure a unique IP via serial, then sysupgrade via SCP/SSH from host.
 
 One asyncio task per --port runs the workflow in an infinite loop and restarts
-when a new device is detected on the same serial line.
+when a new device is detected on the same serial line. The TFTP server is
+embedded by default; pass --external-tftp to point at an existing one instead.
 
-Requires root (or CAP_NET_BIND_SERVICE + CAP_NET_ADMIN): binds UDP/69 and adds
-an IP to a network interface.
+Requires root (or CAP_NET_ADMIN, plus CAP_NET_BIND_SERVICE when the embedded
+TFTP server is in use).
 """
 
 import argparse
@@ -381,7 +382,7 @@ def serial_read_until_pattern(
 
 
 def serial_stop_autoboot(
-    ser: serial.Serial, log, device_ip: IPv4Address, host_ip: IPv4Address
+    ser: serial.Serial, log, device_ip: IPv4Address, tftp_ip: IPv4Address
 ):
     """Interrupt autoboot, then set static IP env. Static-IP variant: no DHCP."""
     log.info("waiting for autoboot prompt")
@@ -402,7 +403,7 @@ def serial_stop_autoboot(
     serial_run(ser, log, "autoreboot off")
     serial_run(ser, log, f"setenv ipaddr {device_ip}")
     serial_run(ser, log, "setenv netmask 255.255.255.0")
-    serial_run(ser, log, f"setenv serverip {host_ip}")
+    serial_run(ser, log, f"setenv serverip {tftp_ip}")
     serial_run(ser, log, "setenv autostart no")
 
 
@@ -478,14 +479,14 @@ def flash_bootloader_step(
     port_path: str,
     baud_in: int,
     device_ip: IPv4Address,
-    host_ip: IPv4Address,
+    tftp_ip: IPv4Address,
     log,
 ):
     log.info("STEP 1: flashing patched bootloader (%s) at %d baud", BOOTLOADER_TFTP_NAME, baud_in)
     with serial.Serial(
         port=port_path, baudrate=baud_in, timeout=SERIAL_TIMEOUT, xonxoff=True
     ) as ser:
-        serial_stop_autoboot(ser, log, device_ip, host_ip)
+        serial_stop_autoboot(ser, log, device_ip, tftp_ip)
         size = serial_netget(ser, log, BOOTLOADER_TFTP_NAME)
         serial_run(ser, log, "sf probe 0")
         serial_run(ser, log, "sf erase 220000 100000")
@@ -500,7 +501,7 @@ def flash_bootloader_step(
 def repartition_and_boot_initramfs_step(
     port_path: str,
     device_ip: IPv4Address,
-    host_ip: IPv4Address,
+    tftp_ip: IPv4Address,
     initramfs_name: str,
     log,
 ):
@@ -528,7 +529,7 @@ def repartition_and_boot_initramfs_step(
     ) as ser:
         # First half: erase NAND, then reset (board_late_init recreates default
         # aos0/aos1/ubifs volumes which we then reshape below).
-        serial_stop_autoboot(ser, log, device_ip, host_ip)
+        serial_stop_autoboot(ser, log, device_ip, tftp_ip)
         serial_run(ser, log, "nand device 0")
         log.warning("erasing NAND - this takes ~30 seconds")
         serial_run(ser, log, "nand erase.chip")
@@ -539,7 +540,7 @@ def repartition_and_boot_initramfs_step(
     with serial.Serial(
         port=port_path, baudrate=baud, timeout=SERIAL_TIMEOUT, xonxoff=True
     ) as ser:
-        serial_stop_autoboot(ser, log, device_ip, host_ip)
+        serial_stop_autoboot(ser, log, device_ip, tftp_ip)
         serial_run(ser, log, "ubi part ubifs")
         serial_run(ser, log, "ubi remove ubifs")
         serial_run(ser, log, "ubi create ubifs 1")
@@ -554,7 +555,7 @@ def repartition_and_boot_initramfs_step(
 def sysupgrade_step(
     port_path: str,
     device_ip: IPv4Address,
-    host_ip: IPv4Address,
+    tftp_ip: IPv4Address,
     sysupgrade_path: Path,
     log,
 ):
@@ -627,19 +628,19 @@ def sysupgrade_step(
             log.info("ssh disconnected (rc=%d) — expected on sysupgrade reboot", e.returncode)
     except Exception as e:
         log.warning("SCP/SSH path failed (%s); falling back to TFTP over serial", e)
-        sysupgrade_over_serial(port_path, sysupgrade_path.name, host_ip, log)
+        sysupgrade_over_serial(port_path, sysupgrade_path.name, tftp_ip, log)
 
 
 def sysupgrade_over_serial(
-    port_path: str, sysupgrade_name: str, host_ip: IPv4Address, log
+    port_path: str, sysupgrade_name: str, tftp_ip: IPv4Address, log
 ):
     """Last-resort fallback: drive sysupgrade entirely from the serial console
-    using busybox's TFTP client against our own TFTP server."""
+    using busybox's TFTP client against the configured TFTP server."""
     with serial.Serial(
         port=port_path, baudrate=BAUD_PATCHED, timeout=SERIAL_TIMEOUT, xonxoff=True
     ) as ser:
         ser.write(
-            f"tftp -g -r {sysupgrade_name} -l /tmp/sysupgrade.bin {host_ip}\r\n".encode("ascii")
+            f"tftp -g -r {sysupgrade_name} -l /tmp/sysupgrade.bin {tftp_ip}\r\n".encode("ascii")
         )
         time.sleep(2)
         end = time.monotonic() + 120
@@ -716,7 +717,7 @@ class PortAdapter(logging.LoggerAdapter):
 async def flash_port_loop(
     port_path: str,
     device_ip: IPv4Address,
-    host_ip: IPv4Address,
+    tftp_ip: IPv4Address,
     initramfs_name: str,
     sysupgrade_path: Path,
 ):
@@ -727,7 +728,7 @@ async def flash_port_loop(
                 _run_one_device,
                 port_path,
                 device_ip,
-                host_ip,
+                tftp_ip,
                 initramfs_name,
                 sysupgrade_path,
                 log,
@@ -745,17 +746,17 @@ async def flash_port_loop(
 def _run_one_device(
     port_path: str,
     device_ip: IPv4Address,
-    host_ip: IPv4Address,
+    tftp_ip: IPv4Address,
     initramfs_name: str,
     sysupgrade_path: Path,
     log,
 ):
     baud = detect_baud(port_path, log)
-    flash_bootloader_step(port_path, baud, device_ip, host_ip, log)
+    flash_bootloader_step(port_path, baud, device_ip, tftp_ip, log)
     repartition_and_boot_initramfs_step(
-        port_path, device_ip, host_ip, initramfs_name, log
+        port_path, device_ip, tftp_ip, initramfs_name, log
     )
-    sysupgrade_step(port_path, device_ip, host_ip, sysupgrade_path, log)
+    sysupgrade_step(port_path, device_ip, tftp_ip, sysupgrade_path, log)
 
 
 # ----- CLI / main ---------------------------------------------------------- #
@@ -766,8 +767,9 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Privileges: needs root (or CAP_NET_BIND_SERVICE + CAP_NET_ADMIN) "
-            "to bind UDP/69 and add a host IP."
+            "Privileges: needs root (or CAP_NET_ADMIN) to add a host IP. "
+            "Also needs CAP_NET_BIND_SERVICE to bind UDP/69 when the embedded "
+            "TFTP server is in use (i.e. when --external-tftp is not set)."
         ),
     )
     parser.add_argument(
@@ -812,6 +814,18 @@ def parse_args() -> argparse.Namespace:
         help="starting host octet for auto-assigned device IPs (default: 10)",
     )
     parser.add_argument(
+        "--external-tftp",
+        type=IPv4Address,
+        default=None,
+        metavar="IP",
+        help=(
+            "use an external TFTP server at this IP instead of starting an "
+            "embedded one. You're responsible for serving u-boot.mbn, the "
+            "initramfs .ari, and the sysupgrade .bin (under their basenames) "
+            "from that server."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -830,7 +844,12 @@ def setup_logging(level: str):
 
 
 def validate_files(args) -> Dict[str, Path]:
-    for f in (args.bootloader, args.initramfs, args.sysupgrade):
+    # sysupgrade is always read locally (uploaded via SCP). bootloader and
+    # initramfs are only needed locally when we run our own TFTP server.
+    must_exist = [args.sysupgrade]
+    if args.external_tftp is None:
+        must_exist += [args.bootloader, args.initramfs]
+    for f in must_exist:
         if not f.is_file():
             raise SystemExit(f"file not found: {f}")
     return {
@@ -866,20 +885,32 @@ async def amain(args):
     files = validate_files(args)
     port_to_ip = assign_device_ips(args)
     host_if = ip_interface(args.host_ip)
+    tftp_ip = args.external_tftp if args.external_tftp is not None else host_if.ip
 
     log.info("host IP: %s on %s", host_if, args.interface)
+    if args.external_tftp is not None:
+        log.info("TFTP server: external at %s (embedded server disabled)", tftp_ip)
+        log.info(
+            "  expected files on that server: %s, %s, %s",
+            BOOTLOADER_TFTP_NAME,
+            args.initramfs.name,
+            args.sysupgrade.name,
+        )
+    else:
+        log.info("TFTP server: embedded at %s:%d", tftp_ip, TFTP_PORT)
     for port, ip in port_to_ip.items():
         log.info("  %s -> device IP %s", port, ip)
 
     with set_host_ip(host_if, args.interface):
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(run_tftp_server(host_if.ip, files))
+            if args.external_tftp is None:
+                tg.create_task(run_tftp_server(host_if.ip, files))
             for port, dev_ip in port_to_ip.items():
                 tg.create_task(
                     flash_port_loop(
                         port,
                         dev_ip,
-                        host_if.ip,
+                        tftp_ip,
                         args.initramfs.name,
                         files[args.sysupgrade.name],
                     )
